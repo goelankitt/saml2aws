@@ -111,7 +111,6 @@ func Login(loginFlags *flags.LoginExecFlags) error {
 }
 
 func MultipleLogin(loginFlags *flags.LoginExecFlags) error {
-	// Handle multiple account login
 	accountList := strings.Split(loginFlags.CommonFlags.IdpAccount, ",")
 	if len(accountList) > 1 {
 		var accounts []*cfg.IDPAccount
