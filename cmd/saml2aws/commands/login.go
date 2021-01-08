@@ -17,6 +17,7 @@ import (
 	"github.com/versent/saml2aws/v2/pkg/cfg"
 	"github.com/versent/saml2aws/v2/pkg/creds"
 	"github.com/versent/saml2aws/v2/pkg/flags"
+	"github.com/versent/saml2aws/v2/pkg/prompter"
 )
 
 // Login login to ADFS
@@ -25,113 +26,13 @@ func Login(loginFlags *flags.LoginExecFlags) error {
 	accountList := strings.Split(loginFlags.CommonFlags.IdpAccount, ",")
 	if len(accountList) > 1 {
 		MultipleLogin(loginFlags)
-	}
-
-	logger := logrus.WithField("command", "login")
-
-	account, err := buildIdpAccount(loginFlags)
-	if err != nil {
-		return errors.Wrap(err, "error building login details")
-	}
-
-	sharedCreds := awsconfig.NewSharedCredentials(account.Profile)
-
-	logger.Debug("check if Creds Exist")
-
-	// this checks if the credentials file has been created yet
-	exist, err := sharedCreds.CredsExists()
-	if err != nil {
-		return errors.Wrap(err, "error loading credentials")
-	}
-	if !exist {
-		log.Println("unable to load credentials, login required to create them")
-		return nil
-	}
-
-	if !sharedCreds.Expired() && !loginFlags.Force {
-		log.Println("credentials are not expired skipping")
-		return nil
-	}
-
-	loginDetails, err := resolveLoginDetails(account, loginFlags)
-	if err != nil {
-		log.Printf("%+v", err)
-		os.Exit(1)
-	}
-
-	err = loginDetails.Validate()
-	if err != nil {
-		return errors.Wrap(err, "error validating login details")
-	}
-
-	logger.WithField("idpAccount", account).Debug("building provider")
-
-	provider, err := saml2aws.NewSAMLClient(account)
-	if err != nil {
-		return errors.Wrap(err, "error building IdP client")
-	}
-
-	log.Printf("Authenticating as %s ...", loginDetails.Username)
-
-	samlAssertion, err := provider.Authenticate(loginDetails)
-	if err != nil {
-		return errors.Wrap(err, "error authenticating to IdP")
-
-	}
-
-	if samlAssertion == "" {
-		log.Println("Response did not contain a valid SAML assertion")
-		log.Println("Please check your username and password is correct")
-		log.Println("To see the output follow the instructions in https://github.com/versent/saml2aws/v2#debugging-issues-with-idps")
-		os.Exit(1)
-	}
-
-	if !loginFlags.CommonFlags.DisableKeychain {
-		err = credentials.SaveCredentials(loginDetails.URL, loginDetails.Username, loginDetails.Password)
-		if err != nil {
-			return errors.Wrap(err, "error storing password in keychain")
-		}
-	}
-
-	role, err := selectAwsRole(samlAssertion, account)
-	if err != nil {
-		return errors.Wrap(err, "Failed to assume role, please check whether you are permitted to assume the given role for the AWS service")
-	}
-
-	log.Println("Selected role:", role.RoleARN)
-
-	awsCreds, err := loginToStsUsingRole(account, role, samlAssertion)
-	if err != nil {
-		return errors.Wrap(err, "error logging into aws role using saml assertion")
-	}
-
-	return saveCredentials(awsCreds, sharedCreds)
-}
-
-func MultipleLogin(loginFlags *flags.LoginExecFlags) error {
-	// Handle multiple account login
-	accountList := strings.Split(loginFlags.CommonFlags.IdpAccount, ",")
-	if len(accountList) > 1 {
-		log.Println("Multiple login flow")
-
-		var accounts []*cfg.IDPAccount
-		for _, item := range accountList {
-			account, err := getIdpAccount(loginFlags, item)
-			if err != nil {
-				return errors.Wrap(err, "error building login details")
-			}
-			accounts = append(accounts, account)
-		}
-
-		log.Println(accounts)
-
+	} else {
 		logger := logrus.WithField("command", "login")
 
-		//	account, err := buildIdpAccount(loginFlags)
-		//	if err != nil {
-		//		return errors.Wrap(err, "error building login details")
-		//	}
-		account := accounts[0]
+		account, err := buildIdpAccount(loginFlags)
+		if err != nil {
+			return errors.Wrap(err, "error building login details")
+		}
 
 		sharedCreds := awsconfig.NewSharedCredentials(account.Profile)
 
@@ -192,7 +93,99 @@ func MultipleLogin(loginFlags *flags.LoginExecFlags) error {
 			}
 		}
 
+		role, err := selectAwsRole(samlAssertion, account)
+		if err != nil {
+			return errors.Wrap(err, "Failed to assume role, please check whether you are permitted to assume the given role for the AWS service")
+		}
+
+		log.Println("Selected role:", role.RoleARN)
+
+		awsCreds, err := loginToStsUsingRole(account, role, samlAssertion)
+		if err != nil {
+			return errors.Wrap(err, "error logging into aws role using saml assertion")
+		}
+
+		return saveCredentials(awsCreds, sharedCreds)
+	}
+	return nil
+}
+
+func MultipleLogin(loginFlags *flags.LoginExecFlags) error {
+	// Handle multiple account login
+	accountList := strings.Split(loginFlags.CommonFlags.IdpAccount, ",")
+	if len(accountList) > 1 {
+		var accounts []*cfg.IDPAccount
+		for _, item := range accountList {
+			account, err := getIdpAccount(loginFlags, item)
+			if err != nil {
+				return errors.Wrap(err, "error building login details")
+			}
+			accounts = append(accounts, account)
+		}
+
+		logger := logrus.WithField("command", "login")
+
+		loginDetails, err := resolveLoginDetails(accounts[0], loginFlags)
+		if err != nil {
+			log.Printf("%+v", err)
+			os.Exit(1)
+		}
+		err = loginDetails.Validate()
+		if err != nil {
+			return errors.Wrap(err, "error validating login details")
+		}
+		mfaToken := prompter.RequestSecurityCode("000000")
+		loginDetails.MFAToken = mfaToken
+
 		for _, account := range accounts {
+			sharedCreds := awsconfig.NewSharedCredentials(account.Profile)
+
+			logger.Debug("check if Creds Exist")
+
+			// this checks if the credentials file has been created yet
+			exist, err := sharedCreds.CredsExists()
+			if err != nil {
+				return errors.Wrap(err, "error loading credentials")
+			}
+			if !exist {
+				log.Println("unable to load credentials, login required to create them")
+				return nil
+			}
+
+			if !sharedCreds.Expired() && !loginFlags.Force {
+				log.Println("credentials are not expired skipping")
+				return nil
+			}
+
+			logger.WithField("idpAccount", account).Debug("building provider")
+
+			provider, err := saml2aws.NewSAMLClient(account)
+			if err != nil {
+				return errors.Wrap(err, "error building IdP client")
+			}
+
+			log.Printf("\nAuthenticating as %s for account %s", loginDetails.Username, account.Profile)
+
+			samlAssertion, err := provider.Authenticate(loginDetails)
+			if err != nil {
+				return errors.Wrap(err, "error authenticating to IdP")
+
+			}
+
+			if samlAssertion == "" {
+				log.Println("Response did not contain a valid SAML assertion")
+				log.Println("Please check your username and password is correct")
+				log.Println("To see the output follow the instructions in https://github.com/versent/saml2aws/v2#debugging-issues-with-idps")
+				os.Exit(1)
+			}
+
+			if !loginFlags.CommonFlags.DisableKeychain {
+				err = credentials.SaveCredentials(loginDetails.URL, loginDetails.Username, loginDetails.Password)
+				if err != nil {
+					return errors.Wrap(err, "error storing password in keychain")
+				}
+			}
+
 			role, err := selectAwsRole(samlAssertion, account)
 			if err != nil {
 				return errors.Wrap(err, "Failed to assume role, please check whether you are permitted to assume the given role for the AWS service")
